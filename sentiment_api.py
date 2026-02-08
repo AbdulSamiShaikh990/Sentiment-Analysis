@@ -3,15 +3,18 @@ import re
 import pandas as pd
 import numpy as np
 from flask import Flask, request, jsonify
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_extraction.text import TfidfVectorizer, ENGLISH_STOP_WORDS
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from textblob import TextBlob
 
 app = Flask(__name__)
 
 # Global variables to store trained model and vectorizer
 vectorizer = None
 model = None
+vader_analyzer = SentimentIntensityAnalyzer()
 
 def load_train_data():
     """Load training data from available CSV files"""
@@ -36,79 +39,254 @@ def load_train_data():
 
 def clean_text(s: str) -> str:
     """Clean and preprocess text for sentiment analysis"""
+    # Remove mentions and URLs
     s = re.sub(r"@[\w]*", " ", s)
-    s = re.sub(r"[^a-zA-Z#]", " ", s)
+    s = re.sub(r"http\S+", " ", s)
+    
+    # Preserve important punctuation for sentiment
+    s = re.sub(r"[^a-zA-Z\s!'.]", " ", s)
+    
+    # Normalize whitespace
     s = re.sub(r"\s+", " ", s)
+    
     return s.strip().lower()
+
+def preprocess_for_sentiment(text: str) -> str:
+    """Advanced preprocessing that preserves sentiment-important patterns"""
+    # Handle negations - add prefix to following words
+    negation_pattern = r'\b(not|no|never|neither|none|nobody|nothing|nowhere|hardly|scarcely|barely)\s+'
+    text = re.sub(negation_pattern, lambda m: m.group(0) + 'NOT_', text, flags=re.IGNORECASE)
+    
+    # Handle intensifiers
+    intensifiers = {
+        'very': 'VERY_',
+        'really': 'REALLY_',
+        'extremely': 'EXTREMELY_',
+        'highly': 'HIGHLY_',
+        'quite': 'QUITE_',
+        'totally': 'TOTALLY_',
+        'completely': 'COMPLETELY_'
+    }
+    
+    for intensifier, prefix in intensifiers.items():
+        pattern = r'\b' + intensifier + r'\s+'
+        text = re.sub(pattern, prefix, text, flags=re.IGNORECASE)
+    
+    return text
+
+def get_stop_words():
+    """Get stop words but keep negation words for better sentiment analysis"""
+    stop_words = set(ENGLISH_STOP_WORDS)
+    # Keep negation words as they're important for sentiment
+    for word in ("no", "not", "nor", "never", "neither", "none"):
+        stop_words.discard(word)
+    return stop_words
+
+def map_rating_to_sentiment(rating: int) -> str:
+    """Map 1-5 rating to 3-class sentiment"""
+    if rating <= 2:
+        return "Negative"
+    if rating == 3:
+        return "Neutral"
+    return "Positive"
+
+def apply_neutral_overrides(sentiment_label: str, class_probabilities_3, confidence_3):
+    """Override to Neutral only for very uncertain cases"""
+    if class_probabilities_3 is None or confidence_3 is None:
+        return sentiment_label
+
+    # Only neutral for extremely uncertain cases
+    if confidence_3 < 0.30:
+        return "Neutral"
+
+    # Only neutral if all three probabilities are very close
+    probs = sorted(class_probabilities_3.values(), reverse=True)
+    if len(probs) >= 3:
+        max_prob = probs[0]
+        second_prob = probs[1] 
+        third_prob = probs[2]
+        
+        # If top 3 are all very close (within 5%), then it's truly ambiguous
+        if (max_prob - third_prob) < 0.05:
+            return "Neutral"
+
+    return sentiment_label
 
 def train_sentiment_model():
     """Train the sentiment analysis model"""
     global vectorizer, model
     
-    print("Training sentiment model...")
+    print("Training improved sentiment model...")
     df = load_train_data()
+    
+    # Combine text fields
     df['combined'] = (df['summary'].astype(str) + ' ' + df['pros'].astype(str) + ' ' + df['cons'].astype(str)).str.strip()
-    df['combined'] = df['combined'].apply(clean_text)
+    
+    # Apply advanced preprocessing
+    df['processed'] = df['combined'].apply(lambda x: preprocess_for_sentiment(clean_text(x)))
+    
     y = df['overall-ratings'].astype(int)
 
-    vectorizer = TfidfVectorizer(max_features=5000, stop_words='english')
-    X = vectorizer.fit_transform(df['combined'])
+    # Use improved TF-IDF with phrase awareness
+    vectorizer = TfidfVectorizer(
+        max_features=8000,
+        stop_words=get_stop_words(),
+        ngram_range=(1, 3),  # Include trigrams for better phrase capture
+        min_df=2,  # Ignore terms that appear in less than 2 documents
+        max_df=0.95,  # Ignore terms that appear in more than 95% of documents
+        sublinear_tf=True  # Apply sublinear TF scaling
+    )
+    
+    X = vectorizer.fit_transform(df['processed'])
 
-    model = LogisticRegression(max_iter=2000, n_jobs=None)
+    # Use LogisticRegression with L2 regularization
+    model = LogisticRegression(
+        max_iter=3000, 
+        C=1.0,  # Regularization strength
+        class_weight='balanced',  # Handle class imbalance
+        random_state=42
+    )
     model.fit(X, y)
-    print("Model trained successfully!")
+    print("Enhanced sentiment model trained successfully!")
+    print(f"Training completed with {len(df)} samples and {X.shape[1]} features")
 
 def analyze_sentiment(text):
     """
-    Main sentiment analysis function
+    Hybrid sentiment analysis using VADER + ML model for better phrase understanding
     Args:
         text (str): Input text to analyze
     Returns:
-        dict: sentiment result with rating and confidence
+        dict: comprehensive sentiment result with multiple analysis methods
     """
-    global vectorizer, model
+    global vectorizer, model, vader_analyzer
     
     if vectorizer is None or model is None:
         raise Exception("Model not trained. Please train the model first.")
     
-    # Clean the input text
-    cleaned_text = clean_text(text)
+    # VADER analysis for rule-based sentiment understanding
+    vader_scores = vader_analyzer.polarity_scores(text)
+    vader_compound = vader_scores['compound']
     
-    # Transform text to features
-    X = vectorizer.transform([cleaned_text])
+    # Map VADER compound score to sentiment
+    def vader_to_sentiment(compound):
+        if compound >= 0.05:
+            return "Positive"
+        elif compound <= -0.05:
+            return "Negative"
+        else:
+            return "Neutral"
     
-    # Predict sentiment rating
-    predicted_rating = model.predict(X)[0]
+    # Map VADER compound to 1-5 rating scale
+    def vader_to_rating(compound):
+        if compound >= 0.6:
+            return 5
+        elif compound >= 0.2:
+            return 4
+        elif compound >= -0.2:
+            return 3
+        elif compound >= -0.6:
+            return 2
+        else:
+            return 1
     
-    # Get prediction probabilities
+    # ML Model Analysis
+    processed_text = preprocess_for_sentiment(clean_text(text))
+    X = vectorizer.transform([processed_text])
+    ml_predicted_rating = model.predict(X)[0]
+    
+    # Get ML model probabilities
     try:
         probabilities = model.predict_proba(X)[0]
-        confidence = float(max(probabilities))
+        ml_confidence_5 = float(max(probabilities))
         
-        # Create probability distribution
-        class_probabilities = {}
-        for i, prob in enumerate(probabilities):
-            class_probabilities[f"rating_{i+1}"] = float(prob)
-            
+        class_probabilities_5 = {
+            f"rating_{i+1}": float(prob)
+            for i, prob in enumerate(probabilities)
+        }
+        
+        # Calculate 3-class probabilities
+        prob_negative = float(sum(probabilities[0:2]))
+        prob_neutral = float(probabilities[2])
+        prob_positive = float(sum(probabilities[3:5]))
+        
+        class_probabilities_3 = {
+            "negative": prob_negative,
+            "neutral": prob_neutral,
+            "positive": prob_positive,
+        }
+        ml_confidence_3 = float(max(class_probabilities_3.values()))
+        
     except Exception:
-        confidence = None
-        class_probabilities = None
+        ml_confidence_5 = None
+        ml_confidence_3 = None
+        class_probabilities_5 = None
+        class_probabilities_3 = None
     
-    # Map rating to sentiment label
-    sentiment_mapping = {
+    # Hybrid Decision Logic
+    vader_rating = vader_to_rating(vader_compound)
+    vader_sentiment = vader_to_sentiment(vader_compound)
+    ml_sentiment = map_rating_to_sentiment(int(ml_predicted_rating))
+    
+    # Determine final sentiment using hybrid approach
+    final_sentiment = ml_sentiment
+    final_rating = int(ml_predicted_rating)
+    confidence = ml_confidence_3 if ml_confidence_3 else 0.5
+    
+    # Apply VADER override for clear cases or when ML model is uncertain
+    if ml_confidence_3 and ml_confidence_3 < 0.4:
+        # ML model is uncertain, trust VADER more
+        final_sentiment = vader_sentiment
+        final_rating = vader_rating
+        confidence = abs(vader_compound)
+    elif abs(vader_compound) > 0.7 and vader_sentiment != ml_sentiment:
+        # VADER is very confident and disagrees with ML, give VADER more weight
+        if abs(vader_compound) > 0.8:
+            final_sentiment = vader_sentiment
+            final_rating = vader_rating
+        else:
+            # Blend the scores
+            blended_rating = int((vader_rating + ml_predicted_rating) / 2)
+            final_rating = blended_rating
+            final_sentiment = map_rating_to_sentiment(blended_rating)
+    
+    # Apply neutral overrides for mixed signals
+    final_sentiment = apply_neutral_overrides(
+        final_sentiment,
+        class_probabilities_3,
+        confidence
+    )
+    
+    # Sentiment mappings
+    sentiment_mapping_5 = {
         1: "Very Negative",
-        2: "Negative", 
-        3: "Neutral",
+        2: "Negative",
+        3: "Neutral", 
         4: "Positive",
         5: "Very Positive"
     }
     
     result = {
-        "predicted_rating": int(predicted_rating),
-        "sentiment_label": sentiment_mapping.get(int(predicted_rating), "Unknown"),
+        "predicted_rating": final_rating,
+        "sentiment_label": final_sentiment,
+        "sentiment_label_5": sentiment_mapping_5.get(final_rating, "Unknown"),
         "confidence": confidence,
-        "class_probabilities": class_probabilities,
-        "input_text": text[:100] + "..." if len(text) > 100 else text  # Truncate for response
+        "confidence_5": ml_confidence_5,
+        "class_probabilities": class_probabilities_3,
+        "class_probabilities_5": class_probabilities_5,
+        "vader_analysis": {
+            "compound": vader_compound,
+            "positive": vader_scores['pos'],
+            "neutral": vader_scores['neu'], 
+            "negative": vader_scores['neg'],
+            "vader_sentiment": vader_sentiment,
+            "vader_rating": vader_rating
+        },
+        "ml_analysis": {
+            "ml_rating": int(ml_predicted_rating),
+            "ml_sentiment": ml_sentiment,
+            "ml_confidence": ml_confidence_3
+        },
+        "input_text": text[:100] + "..." if len(text) > 100 else text
     }
     
     return result
